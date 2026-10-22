@@ -1762,3 +1762,259 @@ func BenchmarkChatGPTPassthroughStreamDecision(b *testing.B) {
 		_ = cfg.streams("POST", "/backend-api/codex/responses", false)
 	}
 }
+
+// TestChatGPTPassthroughStreamEndsWithResponseFailedOnUpstreamError covers an upstream that answers
+// 200 text/event-stream and then fails mid-body. The relay used to stop on the error chunk without
+// writing anything, so Codex saw the stream close with no terminal event, retried the same request
+// blind and reported "stream closed before response.completed" instead of the upstream's error.
+func TestChatGPTPassthroughStreamEndsWithResponseFailedOnUpstreamError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = http.ReadRequest(bufio.NewReader(conn))
+		event := "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n"
+		// Chunked body with no terminating chunk: the connection drops mid-stream.
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n%x\r\n%s\r\n", len(event), event)
+	}()
+
+	client, err := bifrost.Init(context.Background(), schemas.BifrostConfig{Account: codexPassthroughAccount{}, Logger: bifrost.NewNoOpLogger()})
+	require.NoError(t, err)
+	defer client.Shutdown()
+	g := NewGenericRouter(client, &mockHandlerStore{}, nil, nil, nil, bifrost.NewNoOpLogger())
+
+	var ctx fasthttp.RequestCtx
+	bifrostCtx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+	g.handlePassthroughStream(&ctx, bifrostCtx, cancel, schemas.OpenAI, &schemas.BifrostPassthroughRequest{
+		Method:      "POST",
+		Path:        "/backend-api/codex/responses",
+		UpstreamURL: "http://" + ln.Addr().String(),
+		Body:        []byte(`{"model":"gpt-5.5","input":[],"stream":true}`),
+		SafeHeaders: map[string]string{"content-type": "application/json"},
+	})
+	require.Equal(t, 200, ctx.Response.StatusCode())
+
+	bodyStream := ctx.Response.BodyStream()
+	require.NotNil(t, bodyStream)
+	done := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(bodyStream)
+		done <- b
+	}()
+	var body string
+	select {
+	case b := <-done:
+		body = string(b)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out reading the relayed stream")
+	}
+
+	require.Contains(t, body, `"type":"response.created"`, "events before the failure are relayed unchanged")
+	require.Contains(t, body, "event: response.failed\n", "a stream that fails mid-body must end with a terminal event: %q", body)
+	failed := body[strings.LastIndex(body, "data: ")+len("data: "):]
+	var event struct {
+		Type     string `json:"type"`
+		Response struct {
+			Status string `json:"status"`
+			Error  struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"response"`
+	}
+	require.NoError(t, sonic.UnmarshalString(strings.TrimSpace(failed), &event), "terminal frame must be JSON: %q", failed)
+	assert.Equal(t, "response.failed", event.Type)
+	assert.Equal(t, "failed", event.Response.Status)
+	assert.NotEmpty(t, event.Response.Error.Code)
+	assert.NotEmpty(t, event.Response.Error.Message)
+}
+
+// TestPassthroughFailedFrameOnlyForResponsesSSE pins the gate: only an SSE stream on an OpenAI-shaped
+// Responses path speaks response.failed, so every other passthrough keeps ending without a frame.
+func TestPassthroughFailedFrameOnlyForResponsesSSE(t *testing.T) {
+	cases := []struct {
+		name        string
+		provider    schemas.ModelProvider
+		path        string
+		contentType string
+		want        bool
+	}{
+		{"codex responses", schemas.OpenAI, "/backend-api/codex/responses", "text/event-stream", true},
+		{"openai responses", schemas.OpenAI, "/v1/responses", "text/event-stream; charset=utf-8", true},
+		{"azure responses", schemas.Azure, "/openai/v1/responses", "text/event-stream", true},
+		{"openai chat", schemas.OpenAI, "/v1/chat/completions", "text/event-stream", false},
+		{"non sse", schemas.OpenAI, "/v1/responses", "application/json", false},
+		{"anthropic messages", schemas.Anthropic, "/v1/messages", "text/event-stream", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, passthroughEndsWithResponsesFailed(nil, tc.provider, tc.path, tc.contentType))
+		})
+	}
+}
+
+// TestPassthroughResponsesFailedFrameHidesGatewayReadErrors keeps a gateway-side read failure out of
+// the client's response.failed: ProcessAndSendError puts the raw read error ("read tcp 10.0.0.5:...")
+// in the message, which names internal addresses. An upstream's own error still reaches the client.
+func TestPassthroughResponsesFailedFrameHidesGatewayReadErrors(t *testing.T) {
+	failedError := func(frame []byte) (code, message string) {
+		data := strings.TrimSpace(string(frame)[strings.Index(string(frame), "data: ")+len("data: "):])
+		var event struct {
+			Response struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			} `json:"response"`
+		}
+		require.NoError(t, sonic.UnmarshalString(data, &event), "frame must be JSON: %q", frame)
+		return event.Response.Error.Code, event.Response.Error.Message
+	}
+
+	t.Run("gateway read error", func(t *testing.T) {
+		frame := passthroughResponsesFailedFrame(&schemas.BifrostError{
+			IsBifrostError: true,
+			Error:          &schemas.ErrorField{Message: "Error reading stream: read tcp 10.0.0.5:51234->104.18.32.47:443: read: connection reset by peer"},
+		})
+		require.NotNil(t, frame)
+		assert.NotContains(t, string(frame), "10.0.0.5")
+		assert.NotContains(t, string(frame), "read tcp")
+		code, message := failedError(frame)
+		assert.Equal(t, "server_error", code)
+		assert.Equal(t, "upstream stream failed", message)
+	})
+
+	t.Run("upstream error", func(t *testing.T) {
+		frame := passthroughResponsesFailedFrame(&schemas.BifrostError{
+			Error: &schemas.ErrorField{Code: schemas.Ptr("context_length_exceeded"), Message: "Your input exceeds the context window of this model."},
+		})
+		require.NotNil(t, frame)
+		code, message := failedError(frame)
+		assert.Equal(t, "context_length_exceeded", code)
+		assert.Equal(t, "Your input exceeds the context window of this model.", message)
+	})
+}
+
+// relayResponsesPassthrough runs handlePassthroughStream for a Codex Responses request against a raw
+// TCP upstream scripted by upstream, and returns every byte the client received.
+func relayResponsesPassthrough(t *testing.T, upstream func(conn net.Conn)) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = http.ReadRequest(bufio.NewReader(conn))
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n")
+		upstream(conn)
+	}()
+
+	client, err := bifrost.Init(context.Background(), schemas.BifrostConfig{Account: codexPassthroughAccount{}, Logger: bifrost.NewNoOpLogger()})
+	require.NoError(t, err)
+	defer client.Shutdown()
+	g := NewGenericRouter(client, &mockHandlerStore{}, nil, nil, nil, bifrost.NewNoOpLogger())
+
+	var ctx fasthttp.RequestCtx
+	bifrostCtx, cancel := schemas.NewBifrostContextWithCancel(context.Background())
+	g.handlePassthroughStream(&ctx, bifrostCtx, cancel, schemas.OpenAI, &schemas.BifrostPassthroughRequest{
+		Method:      "POST",
+		Path:        "/backend-api/codex/responses",
+		UpstreamURL: "http://" + ln.Addr().String(),
+		Body:        []byte(`{"model":"gpt-5.5","input":[],"stream":true}`),
+		SafeHeaders: map[string]string{"content-type": "application/json"},
+	})
+	require.Equal(t, 200, ctx.Response.StatusCode())
+	bodyStream := ctx.Response.BodyStream()
+	require.NotNil(t, bodyStream)
+	done := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(bodyStream)
+		done <- b
+	}()
+	select {
+	case b := <-done:
+		return string(b)
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out reading the relayed stream")
+		return ""
+	}
+}
+
+// writeChunk writes one HTTP/1.1 chunk and pauses so the relay reads it on its own.
+func writeChunk(conn net.Conn, data string) {
+	_, _ = fmt.Fprintf(conn, "%x\r\n%s\r\n", len(data), data)
+	time.Sleep(50 * time.Millisecond)
+}
+
+const relayCreatedFrame = "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"status\":\"in_progress\"}}\n\n"
+
+// TestResponsesPassthroughDropsPartialFrameBeforeFailure covers an upstream that drops inside a data
+// line. The half-sent line must never reach the client: SSE has no way to cancel a partial line, so
+// the failure frame would be glued onto it and neither would parse.
+func TestResponsesPassthroughDropsPartialFrameBeforeFailure(t *testing.T) {
+	body := relayResponsesPassthrough(t, func(conn net.Conn) {
+		writeChunk(conn, relayCreatedFrame+"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"del")
+	})
+	require.True(t, strings.HasPrefix(body, relayCreatedFrame), "complete frames are relayed unchanged: %q", body)
+	assert.NotContains(t, body, "response.output_text.delta", "the partial frame must not reach the client")
+	rest := strings.TrimPrefix(body, relayCreatedFrame)
+	require.True(t, strings.HasPrefix(rest, "event: response.failed\ndata: "), "the failure frame starts on a fresh line: %q", rest)
+	require.True(t, strings.HasSuffix(rest, "\n\n"), "the failure frame is terminated: %q", rest)
+	var event struct {
+		Type string `json:"type"`
+	}
+	require.NoError(t, sonic.UnmarshalString(strings.TrimSpace(strings.TrimPrefix(rest, "event: response.failed\ndata: ")), &event))
+	assert.Equal(t, "response.failed", event.Type)
+	assert.Contains(t, rest, `"message":"upstream closed the stream before response.completed"`, "a clean close names the truncation")
+}
+
+// TestResponsesPassthroughHealthyStreamIsByteExact keeps a stream that completes untouched: frames
+// split across reads come out byte for byte, and no failure frame is added after response.completed.
+func TestResponsesPassthroughHealthyStreamIsByteExact(t *testing.T) {
+	completed := "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n"
+	split := len(completed) / 2
+	body := relayResponsesPassthrough(t, func(conn net.Conn) {
+		writeChunk(conn, relayCreatedFrame+completed[:split])
+		writeChunk(conn, completed[split:])
+		_, _ = io.WriteString(conn, "0\r\n\r\n")
+	})
+	assert.Equal(t, relayCreatedFrame+completed, body)
+}
+
+// TestResponsesPassthroughConnectionResetEndsWithGenericFailure takes the error-chunk path end to end:
+// a TCP reset surfaces as a gateway read error, which ends the stream with response.failed carrying
+// the generic message, never the read error and its addresses.
+func TestResponsesPassthroughConnectionResetEndsWithGenericFailure(t *testing.T) {
+	body := relayResponsesPassthrough(t, func(conn net.Conn) {
+		writeChunk(conn, relayCreatedFrame)
+		time.Sleep(100 * time.Millisecond)
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+	})
+	require.True(t, strings.HasPrefix(body, relayCreatedFrame), "complete frames are relayed unchanged: %q", body)
+	assert.Contains(t, body, "event: response.failed\n")
+	assert.Contains(t, body, `"message":"upstream stream failed"`)
+	assert.NotContains(t, body, "127.0.0.1")
+	assert.NotContains(t, body, "connection reset")
+}
+
+// BenchmarkResponsesFrameRelay measures the per-chunk cost the gated Responses passthrough pays for
+// whole-frame forwarding: one text delta frame per read, the common shape of a streamed turn.
+func BenchmarkResponsesFrameRelay(b *testing.B) {
+	delta := []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"sequence_number\":7,\"item_id\":\"msg_1\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello world\"}\n\n")
+	relay := &responsesFrameRelay{}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = relay.complete(delta)
+	}
+}
