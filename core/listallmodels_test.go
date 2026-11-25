@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -343,6 +344,46 @@ func TestListAllModelsServesLastKnownModelsWhenPollFails(t *testing.T) {
 	}
 	if !containsModelID(resp, "groq/llama-3.3-70b-versatile") {
 		t.Fatalf("last-known models for the failed provider missing from aggregate; got %v", modelIDs(resp))
+	}
+}
+
+func TestListAllModelsPreservesLastKnownLiveMetadataWhenProviderGoesOffline(t *testing.T) {
+	var fail atomic.Bool
+	strataSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fail.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"inkling-2-mini-ud-q4_k_xl","context_length":524288,"architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}}]}`))
+	}))
+	t.Cleanup(strataSrv.Close)
+
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 10, strataSrv.URL)
+	account.SetKeysForProvider(schemas.OpenAI, wildcardKey(schemas.OpenAI))
+	tuneProviderForTest(t, account, schemas.OpenAI)
+
+	client := newListModelsTestClient(t, account, nil)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	defer ctx.Cancel()
+
+	// First poll succeeds and caches live metadata.
+	resp1, bfErr1 := client.ListAllModels(ctx, &schemas.BifrostListModelsRequest{})
+	if bfErr1 != nil || len(resp1.Data) != 1 || resp1.Data[0].ContextLength == nil || *resp1.Data[0].ContextLength != 524288 {
+		t.Fatalf("expected initial live poll with context_length=524288, got err=%v data=%+v", bfErr1, resp1)
+	}
+
+	// Subsequent poll fails: cached metadata must survive.
+	fail.Store(true)
+	resp2, bfErr2 := client.ListAllModels(ctx, &schemas.BifrostListModelsRequest{})
+	if bfErr2 != nil || len(resp2.Data) != 1 {
+		t.Fatalf("expected cached fallback response, got err=%v data=%+v", bfErr2, resp2)
+	}
+	if resp2.Data[0].ContextLength == nil || *resp2.Data[0].ContextLength != 524288 {
+		t.Fatalf("expected preserved context_length=524288 on offline fallback, got %+v", resp2.Data[0].ContextLength)
+	}
+	if resp2.Data[0].Architecture == nil || len(resp2.Data[0].Architecture.InputModalities) != 2 {
+		t.Fatalf("expected preserved architecture on offline fallback, got %+v", resp2.Data[0].Architecture)
 	}
 }
 

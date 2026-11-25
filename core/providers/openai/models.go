@@ -7,6 +7,61 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
+func resolveOpenAIModelName(model *OpenAIModel) *string {
+	if model == nil {
+		return nil
+	}
+	if model.DisplayName != nil && *model.DisplayName != "" {
+		return model.DisplayName
+	}
+	if model.Name != nil && *model.Name != "" {
+		return model.Name
+	}
+	return nil
+}
+
+func resolveOpenAIModelArchitecture(model *OpenAIModel) *schemas.Architecture {
+	if model == nil {
+		return nil
+	}
+	var arch *schemas.Architecture
+	if model.Architecture != nil {
+		copyArch := *model.Architecture
+		if model.Architecture.InputModalities != nil {
+			copyArch.InputModalities = append([]string(nil), model.Architecture.InputModalities...)
+		}
+		if model.Architecture.OutputModalities != nil {
+			copyArch.OutputModalities = append([]string(nil), model.Architecture.OutputModalities...)
+		}
+		arch = &copyArch
+	} else if model.Modalities != nil {
+		arch = &schemas.Architecture{
+			InputModalities:  append([]string(nil), model.Modalities.Input...),
+			OutputModalities: append([]string(nil), model.Modalities.Output...),
+		}
+	}
+
+	if arch == nil || len(arch.InputModalities) == 0 {
+		var visionFlag *bool
+		if model.Capabilities != nil && model.Capabilities.Vision != nil {
+			visionFlag = model.Capabilities.Vision
+		} else if model.SupportsVision != nil {
+			visionFlag = model.SupportsVision
+		}
+		if visionFlag != nil {
+			if arch == nil {
+				arch = &schemas.Architecture{OutputModalities: []string{"text"}}
+			}
+			if *visionFlag {
+				arch.InputModalities = []string{"text", "image"}
+			} else {
+				arch.InputModalities = []string{"text"}
+			}
+		}
+	}
+	return arch
+}
+
 // ToBifrostListModelsResponse converts an OpenAI list models response to a Bifrost list models response
 func (response *OpenAIListModelsResponse) ToBifrostListModelsResponse(providerKey schemas.ModelProvider, allowedModels schemas.WhiteList, blacklistedModels schemas.BlackList, aliases schemas.KeyAliases, unfiltered bool) *schemas.BifrostListModelsResponse {
 	if response == nil {
@@ -32,12 +87,18 @@ func (response *OpenAIListModelsResponse) ToBifrostListModelsResponse(providerKe
 	included := make(map[string]bool)
 
 	for _, model := range response.Data {
+		reconcileOpenAIContextWindow(&model)
 		for _, result := range pipeline.FilterModel(model.ID) {
 			entry := schemas.Model{
-				ID:            string(providerKey) + "/" + result.ResolvedID,
-				Created:       model.Created,
-				OwnedBy:       schemas.Ptr(model.OwnedBy),
-				ContextLength: model.ContextWindow,
+				ID:              string(providerKey) + "/" + result.ResolvedID,
+				Name:            resolveOpenAIModelName(&model),
+				Created:         model.Created,
+				OwnedBy:         schemas.Ptr(model.OwnedBy),
+				ContextLength:   model.ContextWindow,
+				MaxInputTokens:  model.MaxInputTokens,
+				MaxOutputTokens: model.MaxOutputTokens,
+				Architecture:    resolveOpenAIModelArchitecture(&model),
+				Reasoning:       toSchemasModelReasoning(model.Reasoning),
 			}
 			if result.AliasValue != "" {
 				entry.Alias = schemas.Ptr(result.AliasValue)
@@ -58,14 +119,21 @@ func (model *OpenAIModel) ToBifrostModelRetrieveResponse(providerKey schemas.Mod
 	if model == nil {
 		return nil
 	}
+	copyModel := *model
+	reconcileOpenAIContextWindow(&copyModel)
 
 	return &schemas.BifrostModelRetrieveResponse{
 		Model: schemas.Model{
-			ID:            string(providerKey) + "/" + model.ID,
-			Created:       model.Created,
-			OwnedBy:       schemas.Ptr(model.OwnedBy),
-			ContextLength: model.ContextWindow,
-			ShutdownDate:  model.ShutdownDate,
+			ID:              string(providerKey) + "/" + copyModel.ID,
+			Name:            resolveOpenAIModelName(&copyModel),
+			Created:         copyModel.Created,
+			OwnedBy:         schemas.Ptr(copyModel.OwnedBy),
+			ContextLength:   copyModel.ContextWindow,
+			MaxInputTokens:  copyModel.MaxInputTokens,
+			MaxOutputTokens: copyModel.MaxOutputTokens,
+			Architecture:    resolveOpenAIModelArchitecture(&copyModel),
+			Reasoning:       toSchemasModelReasoning(copyModel.Reasoning),
+			ShutdownDate:    copyModel.ShutdownDate,
 		},
 	}
 }
@@ -78,18 +146,29 @@ func ToOpenAIModelRetrieveResponse(response *schemas.BifrostModelRetrieveRespons
 	}
 
 	openaiModel := &OpenAIModel{
-		ID:           response.ID,
-		Object:       "model",
-		Created:      response.Created,
-		ShutdownDate: response.ShutdownDate,
+		ID:              response.ID,
+		Object:          "model",
+		Created:         response.Created,
+		ShutdownDate:    response.ShutdownDate,
+		MaxInputTokens:  response.MaxInputTokens,
+		MaxOutputTokens: response.MaxOutputTokens,
+		Name:            response.Name,
+		Reasoning:       fromSchemasModelReasoning(response.Reasoning),
+		Architecture:    response.Architecture,
 	}
 	if response.OwnedBy != nil {
 		openaiModel.OwnedBy = *response.OwnedBy
 	}
-	if response.ContextLength != nil {
-		openaiModel.ContextWindow = response.ContextLength
-	} else if response.MaxInputTokens != nil {
-		openaiModel.ContextWindow = response.MaxInputTokens // Fallback to MaxInputTokens if ContextLength is not set
+	openaiModel.ContextWindow = response.ContextLength
+	if openaiModel.ContextWindow == nil {
+		openaiModel.ContextWindow = response.MaxInputTokens
+	}
+	openaiModel.ContextLength = response.ContextLength
+	if response.Architecture != nil && (len(response.Architecture.InputModalities) > 0 || len(response.Architecture.OutputModalities) > 0) {
+		openaiModel.Modalities = &OpenAIModelModalities{
+			Input:  response.Architecture.InputModalities,
+			Output: response.Architecture.OutputModalities,
+		}
 	}
 	return openaiModel
 }
@@ -104,8 +183,13 @@ func ToOpenAIListModelsResponse(response *schemas.BifrostListModelsResponse) *Op
 	}
 	for _, model := range response.Data {
 		openaiModel := OpenAIModel{
-			ID:     model.ID,
-			Object: "model",
+			ID:              model.ID,
+			Object:          "model",
+			MaxInputTokens:  model.MaxInputTokens,
+			MaxOutputTokens: model.MaxOutputTokens,
+			Name:            model.Name,
+			Reasoning:       fromSchemasModelReasoning(model.Reasoning),
+			Architecture:    model.Architecture,
 		}
 		if model.Created != nil {
 			openaiModel.Created = model.Created
@@ -113,10 +197,16 @@ func ToOpenAIListModelsResponse(response *schemas.BifrostListModelsResponse) *Op
 		if model.OwnedBy != nil {
 			openaiModel.OwnedBy = *model.OwnedBy
 		}
-		if model.ContextLength != nil {
-			openaiModel.ContextWindow = model.ContextLength
-		} else if model.MaxInputTokens != nil {
-			openaiModel.ContextWindow = model.MaxInputTokens // Fallback to MaxInputTokens if ContextLength is not set
+		openaiModel.ContextWindow = model.ContextLength
+		if openaiModel.ContextWindow == nil {
+			openaiModel.ContextWindow = model.MaxInputTokens
+		}
+		openaiModel.ContextLength = model.ContextLength
+		if model.Architecture != nil && (len(model.Architecture.InputModalities) > 0 || len(model.Architecture.OutputModalities) > 0) {
+			openaiModel.Modalities = &OpenAIModelModalities{
+				Input:  model.Architecture.InputModalities,
+				Output: model.Architecture.OutputModalities,
+			}
 		}
 
 		openaiResponse.Data = append(openaiResponse.Data, openaiModel)

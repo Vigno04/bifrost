@@ -167,6 +167,13 @@ type Bifrost struct {
 	keyPoolFilter              schemas.KeyPoolFilter                 // optional hook to veto keys before selection (nil = all eligible)
 	kvStore                    schemas.KVStore                       // optional KV store for session stickiness (nil = disabled)
 	sessionAffinity            schemas.SessionAffinity               // decides which key a session stays on; never nil after Init
+	lastKnownLiveModelsMu      sync.RWMutex
+	lastKnownLiveModels        map[lastKnownModelsKey][]schemas.Model
+}
+
+type lastKnownModelsKey struct {
+	provider   schemas.ModelProvider
+	unfiltered bool
 }
 
 // ProviderQueue wraps a provider's request channel with lifecycle management
@@ -644,10 +651,50 @@ func isExpectedListModelsError(err *schemas.BifrostError) bool {
 	return strings.Contains(err.Error.Message, "no keys found") || strings.Contains(err.Error.Message, "not supported")
 }
 
+func (bifrost *Bifrost) recordLastKnownLiveModels(providerKey schemas.ModelProvider, req *schemas.BifrostListModelsRequest, resp *schemas.BifrostResponse) {
+	if req == nil || req.PageToken != "" || resp == nil || resp.ListModelsResponse == nil || len(resp.ListModelsResponse.Data) == 0 {
+		return
+	}
+	copied := make([]schemas.Model, len(resp.ListModelsResponse.Data))
+	for i, m := range resp.ListModelsResponse.Data {
+		copied[i] = m
+		if m.Architecture != nil {
+			archCopy := *m.Architecture
+			if m.Architecture.InputModalities != nil {
+				archCopy.InputModalities = append([]string(nil), m.Architecture.InputModalities...)
+			}
+			if m.Architecture.OutputModalities != nil {
+				archCopy.OutputModalities = append([]string(nil), m.Architecture.OutputModalities...)
+			}
+			copied[i].Architecture = &archCopy
+		}
+	}
+	key := lastKnownModelsKey{provider: providerKey, unfiltered: req.Unfiltered}
+	bifrost.lastKnownLiveModelsMu.Lock()
+	if bifrost.lastKnownLiveModels == nil {
+		bifrost.lastKnownLiveModels = make(map[lastKnownModelsKey][]schemas.Model)
+	}
+	bifrost.lastKnownLiveModels[key] = copied
+	bifrost.lastKnownLiveModelsMu.Unlock()
+}
+
+func (bifrost *Bifrost) getLastKnownLiveModels(providerKey schemas.ModelProvider, unfiltered bool) []schemas.Model {
+	key := lastKnownModelsKey{provider: providerKey, unfiltered: unfiltered}
+	bifrost.lastKnownLiveModelsMu.RLock()
+	cached := bifrost.lastKnownLiveModels[key]
+	bifrost.lastKnownLiveModelsMu.RUnlock()
+	if len(cached) == 0 {
+		return nil
+	}
+	out := make([]schemas.Model, len(cached))
+	copy(out, cached)
+	return out
+}
+
 // lastKnownListModelsResponse answers a failed first-page poll from ListAllModels with the
-// provider's last-known models from the catalog, or returns nil to keep the error. It runs in
-// the worker after retries and before the post-hooks, so plugins narrow the last-known list
-// exactly as they narrow a live one: a virtual key's model allow and block lists still apply.
+// provider's last-known models (live cache with full metadata first, then catalog fallback),
+// or returns nil to keep the error. It runs in the worker after retries and before the post-hooks,
+// so plugins narrow the last-known list exactly as they narrow a live one.
 func (bifrost *Bifrost) lastKnownListModelsResponse(ctx *schemas.BifrostContext, providerKey schemas.ModelProvider, req *schemas.BifrostListModelsRequest, err *schemas.BifrostError) *schemas.BifrostResponse {
 	if req == nil || req.PageToken != "" || isExpectedListModelsError(err) {
 		return nil
@@ -655,11 +702,16 @@ func (bifrost *Bifrost) lastKnownListModelsResponse(ctx *schemas.BifrostContext,
 	if fallback, _ := ctx.Value(listAllModelsFallbackKey).(bool); !fallback {
 		return nil
 	}
-	models := bifrost.lastKnownModelsFromCatalog(providerKey, req.Unfiltered)
+	models := bifrost.getLastKnownLiveModels(providerKey, req.Unfiltered)
+	source := "live cache"
+	if len(models) == 0 {
+		models = bifrost.lastKnownModelsFromCatalog(providerKey, req.Unfiltered)
+		source = "model catalog"
+	}
 	if len(models) == 0 {
 		return nil
 	}
-	bifrost.logger.Warn("serving %d last-known models for provider %s from the model catalog after its live poll failed: %s", len(models), providerKey, err.GetErrorString())
+	bifrost.logger.Warn("serving %d last-known models for provider %s from the %s after its live poll failed: %s", len(models), providerKey, source, err.GetErrorString())
 	return &schemas.BifrostResponse{ListModelsResponse: &schemas.BifrostListModelsResponse{
 		Data:        models,
 		KeyStatuses: err.ExtraFields.KeyStatuses,
@@ -8703,8 +8755,10 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				}
 				return bifrost.handleProviderRequest(provider, config, req, k, keys)
 			}, keyProvider, req.RequestType, provider.GetProviderKey(), model, &req.BifrostRequest, bifrost.logger)
-			if bifrostError != nil && req.RequestType == schemas.ListModelsRequest {
-				if fallback := bifrost.lastKnownListModelsResponse(req.Context, provider.GetProviderKey(), req.BifrostRequest.ListModelsRequest, bifrostError); fallback != nil {
+			if req.RequestType == schemas.ListModelsRequest {
+				if bifrostError == nil {
+					bifrost.recordLastKnownLiveModels(provider.GetProviderKey(), req.BifrostRequest.ListModelsRequest, result)
+				} else if fallback := bifrost.lastKnownListModelsResponse(req.Context, provider.GetProviderKey(), req.BifrostRequest.ListModelsRequest, bifrostError); fallback != nil {
 					result, bifrostError = fallback, nil
 				}
 			}

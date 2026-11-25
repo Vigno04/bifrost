@@ -1,0 +1,60 @@
+name: Build Patched Bifrost Image
+
+on:
+  push:
+    branches:
+      - "patched/**"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.4"
+          cache-dependency-path: core/go.sum
+
+      - name: Run core list-models unit tests
+        working-directory: core
+        run: |
+          go test ./providers/openai/ -run 'TestListModels|TestModelRetrieve' -count=1 -v
+          go test . -run 'TestListAllModels' -count=1 -v
+
+      - name: Downcase repository name for image
+        run: |
+          echo "IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push patched image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: transports/Dockerfile.local
+          platforms: linux/amd64
+          push: true
+          build-args: VERSION=2.6.0-patched
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:patched
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v2.6.0-patched
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

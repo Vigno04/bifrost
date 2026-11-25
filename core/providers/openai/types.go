@@ -1667,6 +1667,64 @@ func (r *OpenAITranscriptionRequest) IsStreamingRequested() bool {
 	return r.Stream != nil && *r.Stream
 }
 
+// OpenAIModelModalities mirrors the `modalities` object emitted by OpenAI-compatible upstreams.
+type OpenAIModelModalities struct {
+	Input  []string `json:"input,omitempty"`
+	Output []string `json:"output,omitempty"`
+}
+
+// OpenAIModelCapabilities mirrors `capabilities` emitted by llama-swap / OpenAI-compatible servers.
+type OpenAIModelCapabilities struct {
+	Vision *bool `json:"vision,omitempty"`
+}
+
+// openAIModelReasoning tolerates both OpenRouter-style objects and boolean flags.
+type openAIModelReasoning struct {
+	schemas.ModelReasoning
+	absent bool
+}
+
+func (r *openAIModelReasoning) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		r.absent = true
+		return nil
+	}
+	if trimmed[0] == 't' || trimmed[0] == 'f' {
+		var flag bool
+		if err := sonic.Unmarshal(trimmed, &flag); err != nil {
+			return err
+		}
+		r.absent = !flag
+		return nil
+	}
+	var reasoning schemas.ModelReasoning
+	if err := sonic.Unmarshal(trimmed, &reasoning); err != nil {
+		return err
+	}
+	r.ModelReasoning = reasoning
+	return nil
+}
+
+func (r openAIModelReasoning) MarshalJSON() ([]byte, error) {
+	return sonic.Marshal(r.ModelReasoning)
+}
+
+func toSchemasModelReasoning(r *openAIModelReasoning) *schemas.ModelReasoning {
+	if r == nil || r.absent {
+		return nil
+	}
+	reasoning := r.ModelReasoning
+	return &reasoning
+}
+
+func fromSchemasModelReasoning(reasoning *schemas.ModelReasoning) *openAIModelReasoning {
+	if reasoning == nil {
+		return nil
+	}
+	return &openAIModelReasoning{ModelReasoning: *reasoning}
+}
+
 // OpenAIModel represents an OpenAI model
 type OpenAIModel struct {
 	ID      string `json:"id"`
@@ -1680,6 +1738,32 @@ type OpenAIModel struct {
 	// GROQ specific fields
 	Active        *bool `json:"active,omitempty"`
 	ContextWindow *int  `json:"context_window,omitempty"`
+
+	// Extended upstream metadata for OpenAI-compatible endpoints (anti-api, llama-swap, strata, vLLM, OpenRouter, Kimi)
+	ContextLength    *int                     `json:"context_length,omitempty"`
+	MaxModelLen      *int                     `json:"max_model_len,omitempty"`
+	MaxContextLength *int                     `json:"max_context_length,omitempty"`
+	MaxInputTokens   *int                     `json:"max_input_tokens,omitempty"`
+	MaxOutputTokens  *int                     `json:"max_output_tokens,omitempty"`
+	Name             *string                  `json:"name,omitempty"`
+	DisplayName      *string                  `json:"display_name,omitempty"`
+	Reasoning        *openAIModelReasoning    `json:"reasoning,omitempty"`
+	Modalities       *OpenAIModelModalities   `json:"modalities,omitempty"`
+	Architecture     *schemas.Architecture    `json:"architecture,omitempty"`
+	Capabilities     *OpenAIModelCapabilities `json:"capabilities,omitempty"`
+	SupportsVision   *bool                    `json:"supports_vision,omitempty"`
+}
+
+func reconcileOpenAIContextWindow(m *OpenAIModel) {
+	if m == nil || m.ContextWindow != nil {
+		return
+	}
+	for _, candidate := range []*int{m.ContextLength, m.MaxModelLen, m.MaxContextLength} {
+		if candidate != nil && *candidate > 0 {
+			m.ContextWindow = candidate
+			return
+		}
+	}
 }
 
 // OpenAIListModelsResponse represents an OpenAI list models response
@@ -1694,27 +1778,29 @@ func (response *OpenAIListModelsResponse) UnmarshalJSON(data []byte) error {
 
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 || trimmed[0] != '[' {
-		return sonic.Unmarshal(trimmed, (*envelope)(response))
+		if err := sonic.Unmarshal(trimmed, (*envelope)(response)); err != nil {
+			return err
+		}
+	} else {
+		var models []struct {
+			OpenAIModel
+			Organization string `json:"organization"`
+		}
+		if err := sonic.Unmarshal(trimmed, &models); err != nil {
+			return err
+		}
+
+		response.Data = make([]OpenAIModel, len(models))
+		for i, model := range models {
+			response.Data[i] = model.OpenAIModel
+			if response.Data[i].OwnedBy == "" {
+				response.Data[i].OwnedBy = model.Organization
+			}
+		}
 	}
 
-	var models []struct {
-		OpenAIModel
-		Organization  string `json:"organization"`
-		ContextLength *int   `json:"context_length,omitempty"`
-	}
-	if err := sonic.Unmarshal(trimmed, &models); err != nil {
-		return err
-	}
-
-	response.Data = make([]OpenAIModel, len(models))
-	for i, model := range models {
-		response.Data[i] = model.OpenAIModel
-		if response.Data[i].OwnedBy == "" {
-			response.Data[i].OwnedBy = model.Organization
-		}
-		if response.Data[i].ContextWindow == nil {
-			response.Data[i].ContextWindow = model.ContextLength
-		}
+	for i := range response.Data {
+		reconcileOpenAIContextWindow(&response.Data[i])
 	}
 	return nil
 }
