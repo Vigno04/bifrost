@@ -846,8 +846,16 @@ func configureDialer(
 			if resolveErr != nil {
 				return nil, resolveErr
 			}
-			dialer := &net.Dialer{
+			publicDialer := &net.Dialer{
 				Timeout:         client.ReadTimeout,
+				KeepAliveConfig: keepAliveCfg,
+			}
+			privateDialTimeout := 2 * time.Second
+			if client.ReadTimeout > 0 && client.ReadTimeout < privateDialTimeout {
+				privateDialTimeout = client.ReadTimeout
+			}
+			privateDialer := &net.Dialer{
+				Timeout:         privateDialTimeout,
 				KeepAliveConfig: keepAliveCfg,
 			}
 			var lastErr error
@@ -855,7 +863,11 @@ func configureDialer(
 				if blockErr := checkDialIP(ip, allowPrivateNetwork); blockErr != nil {
 					return nil, blockErr
 				}
-				conn, err = dial(dialer, "tcp", net.JoinHostPort(ip.String(), port))
+				activeDialer := publicDialer
+				if ip.IsLoopback() || network.IsPrivateIP(ip) {
+					activeDialer = privateDialer
+				}
+				conn, err = dial(activeDialer, "tcp", net.JoinHostPort(ip.String(), port))
 				if err == nil {
 					break
 				}

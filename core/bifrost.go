@@ -783,18 +783,20 @@ func (bifrost *Bifrost) ListAllModels(ctx *schemas.BifrostContext, req *schemas.
 			continue
 		}
 
-		// Custom providers can disable list_models via allowed_requests; the call would
-		// only bounce with "unsupported operation", so don't spend a request on it here.
-		// Scoped to the fan-out: a direct ListModelsRequest still returns the error.
-		if config, err := bifrost.account.GetConfigForProvider(providerKey); err == nil && config != nil &&
-			config.CustomProviderConfig != nil &&
-			!config.CustomProviderConfig.IsOperationAllowed(schemas.ListModelsRequest) {
-			bifrost.logger.Debug("skipping provider %s in list all models: list_models is disabled via allowed_requests", providerKey)
-			continue
+		providerTimeout := listAllModelsProviderTimeout
+		if config, err := bifrost.account.GetConfigForProvider(providerKey); err == nil && config != nil {
+			if config.CustomProviderConfig != nil &&
+				!config.CustomProviderConfig.IsOperationAllowed(schemas.ListModelsRequest) {
+				bifrost.logger.Debug("skipping provider %s in list all models: list_models is disabled via allowed_requests", providerKey)
+				continue
+			}
+			if config.NetworkConfig.ListModelsTimeoutInSeconds > 0 {
+				providerTimeout = time.Duration(config.NetworkConfig.ListModelsTimeoutInSeconds) * time.Second
+			}
 		}
 
 		wg.Add(1)
-		go func(providerKey schemas.ModelProvider) {
+		go func(providerKey schemas.ModelProvider, providerTimeout time.Duration) {
 			defer wg.Done()
 
 			requestID := uuid.New().String()
@@ -830,7 +832,7 @@ func (bifrost *Bifrost) ListAllModels(ctx *schemas.BifrostContext, req *schemas.
 				// aggregate until the shared request timeout: at the deadline
 				// tryRequest stops waiting on the worker (the in-flight HTTP call
 				// is abandoned, not cancelled) and wg.Wait() finishes.
-				pageCtx := schemas.NewBifrostContext(ctx, time.Now().Add(listAllModelsProviderTimeout))
+				pageCtx := schemas.NewBifrostContext(ctx, time.Now().Add(providerTimeout))
 				pageCtx.SetValue(schemas.BifrostContextKeyRequestID, requestID)
 				pageCtx.SetValue(listAllModelsFallbackKey, true)
 				response, bifrostErr := bifrost.ListModelsRequest(pageCtx, providerRequest)
@@ -874,7 +876,7 @@ func (bifrost *Bifrost) ListAllModels(ctx *schemas.BifrostContext, req *schemas.
 				keyStatuses: providerKeyStatuses,
 				err:         providerErr,
 			}
-		}(providerKey)
+		}(providerKey, providerTimeout)
 	}
 
 	// Wait for all goroutines to complete

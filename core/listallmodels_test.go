@@ -495,3 +495,49 @@ func TestListModelsRequestDoesNotServeLastKnownModels(t *testing.T) {
 		t.Fatalf("expected the poll error from a single-provider list call; got %v", modelIDs(resp))
 	}
 }
+
+func TestListAllModelsUsesPerProviderListModelsTimeoutOverride(t *testing.T) {
+	healthySrv := httptest.NewServer(openAIStyleModelsHandler("gpt-4o"))
+	t.Cleanup(healthySrv.Close)
+
+	done := make(chan struct{})
+	slowSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-done:
+			return
+		case <-time.After(3500 * time.Millisecond):
+			openAIStyleModelsHandler("slow-model")(w, r)
+		}
+	}))
+	t.Cleanup(func() {
+		close(done)
+		slowSrv.Close()
+	})
+
+	account := NewMockAccount()
+	account.AddProviderWithBaseURL(schemas.OpenAI, 1, 10, healthySrv.URL)
+	account.AddProviderWithBaseURL(schemas.Groq, 1, 10, slowSrv.URL)
+	account.SetKeysForProvider(schemas.OpenAI, wildcardKey(schemas.OpenAI))
+	account.SetKeysForProvider(schemas.Groq, wildcardKey(schemas.Groq))
+	tuneProviderForTest(t, account, schemas.OpenAI)
+	tuneProviderForTest(t, account, schemas.Groq)
+	account.configs[schemas.Groq].NetworkConfig.DefaultRequestTimeoutInSeconds = 30
+	account.configs[schemas.Groq].NetworkConfig.ListModelsTimeoutInSeconds = 1
+
+	client := newListModelsTestClient(t, account, nil)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	defer ctx.Cancel()
+
+	start := time.Now()
+	resp, bfErr := client.ListAllModels(ctx, &schemas.BifrostListModelsRequest{})
+	elapsed := time.Since(start)
+	if bfErr != nil {
+		t.Fatalf("ListAllModels returned error: %s", bfErr.GetErrorString())
+	}
+	if elapsed >= 2500*time.Millisecond {
+		t.Fatalf("ListAllModels waited %v; expected per-provider ListModelsTimeoutInSeconds=1s override to cut off slow provider", elapsed)
+	}
+	if !containsModelID(resp, "openai/gpt-4o") {
+		t.Fatalf("healthy provider missing: %v", modelIDs(resp))
+	}
+}

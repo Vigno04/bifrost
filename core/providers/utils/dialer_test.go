@@ -754,3 +754,36 @@ func BenchmarkConfigureNetHTTPDialer(b *testing.B) {
 		_ = conn.Close()
 	}
 }
+
+func TestConfigureDialer_CapsPrivateDialTimeout(t *testing.T) {
+	var seenPrivateTimeout, seenPublicTimeout time.Duration
+	client := &fasthttp.Client{ReadTimeout: 300 * time.Second}
+	configureDialer(
+		client,
+		true,
+		func(ctx context.Context, network, host string) ([]net.IP, error) {
+			if host == "lan.local" {
+				return []net.IP{net.ParseIP("192.168.1.10")}, nil
+			}
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		},
+		func(d *net.Dialer, network, addr string) (net.Conn, error) {
+			if strings.HasPrefix(addr, "192.168.1.10:") {
+				seenPrivateTimeout = d.Timeout
+			} else {
+				seenPublicTimeout = d.Timeout
+			}
+			return nil, errors.New("stub dial stop")
+		},
+	)
+
+	_, _ = client.Dial("lan.local:47831")
+	_, _ = client.Dial("example.com:443")
+
+	if seenPrivateTimeout != 2*time.Second {
+		t.Fatalf("private IP dial timeout = %v, want 2s", seenPrivateTimeout)
+	}
+	if seenPublicTimeout != 300*time.Second {
+		t.Fatalf("public IP dial timeout = %v, want 300s", seenPublicTimeout)
+	}
+}
